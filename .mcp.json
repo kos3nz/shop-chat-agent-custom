@@ -6,7 +6,8 @@
       "args": ["-y", "@shopify/dev-mcp@latest"],
       "env": {
         "POLARIS_UNIFIED": "true",
-        "LIQUID": "true"
+        "LIQUID": "true",
+        "OPT_OUT_INSTRUMENTATION": "true"
       }
     }
   }
