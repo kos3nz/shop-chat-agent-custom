@@ -1,22 +1,39 @@
 {
-  "include": ["env.d.ts", "**/*.ts", "**/*.tsx", ".react-router/types/**/*"],
   "compilerOptions": {
-    "lib": ["DOM", "DOM.Iterable", "ES2022"],
-    "strict": true,
-    "skipLibCheck": true,
-    "isolatedModules": true,
-    "allowSyntheticDefaultImports": true,
-    "removeComments": false,
-    "forceConsistentCasingInFileNames": true,
-    "noEmit": true,
-    "allowJs": true,
-    "resolveJsonModule": true,
+    /* Language & Environment */
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
+
+    /* Modules */
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "target": "ES2022",
-    "baseUrl": ".",
-    "types": ["@react-router/node", "vite/client", "@shopify/polaris-types"],
-    "rootDirs": [".", "./.react-router/types"]
-  }
+    "moduleDetection": "force",
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+
+    /* Type Checking */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Emit */
+    "noEmit": true,
+    "skipLibCheck": true,
+
+    /* Path Mapping & Types (React Router v7) */
+    "paths": {
+      "~/*": ["./app/*"]
+    },
+    "rootDirs": [".", "./.react-router/types"],
+    "types": [
+      "node",
+      "@react-router/node",
+      "vite/client",
+      "@shopify/polaris-types"
+    ]
+  },
+  "include": ["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", ".react-router/types/**/*"]
 }
