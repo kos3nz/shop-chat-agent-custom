@@ -849,8 +849,25 @@ export function createToolService() {
 ```
 
 `★ Insight ─────────────────────────────────────`
+
 このエージェントは**マルチターン推論**を実装しています。単純なLLM呼び出しと異なり、Claudeは複数回の思考サイクルを経て、ツールを連鎖的に使用します（例: 製品検索 → カート追加 → チェックアウトURL生成）。`while`ループと会話履歴への結果追加が、この自律的な振る舞いを可能にしています。
+
+- TAG over RAG: This codebase uses Tool-Augmented Generation, not Retrieval-Augmented Generation. Claude dynamically calls Shopify APIs via MCP at inference
+  time rather than pre-fetching docs into a vector store. This is a key architectural distinction worth highlighting.
+- Dual MCP endpoints: The storefront vs customer endpoint split means tool routing (callTool in mcp-client.js) is a critical piece — it inspects which tool
+  list a name belongs to before dispatching. This pattern would be easy to break if tools are added without updating both connection methods.
+- No tests: The repo has no test framework, so lint + typecheck are the only automated quality gates. Future Claude instances should know this to avoid
+  trying to run nonexistent test commands.
+
 `─────────────────────────────────────────────────`
+
+The file covers:
+
+1. All dev commands (dev, build, setup, lint, typecheck, deploy)
+2. Architecture — the TAG agentic loop, SSE streaming flow, and MCP dual-endpoint pattern
+3. Key files with their roles, so future instances can jump straight to the right file
+4. Database schema overview and migration workflow
+5. Conventions — .server.js suffix, ES modules, SSE event format, Node version requirement
 
 ---
 
