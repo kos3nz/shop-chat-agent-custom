@@ -24,7 +24,18 @@ module.exports = {
   // Base config
   extends: ["eslint:recommended"],
 
+  rules: {
+    "no-useless-catch": "off",
+  },
+
   overrides: [
+    // Use @typescript-eslint/parser for JS/JSX files
+    // (espree in ESLint 8 doesn't support import attributes `with` syntax)
+    {
+      files: ["**/*.{js,jsx}"],
+      parser: "@typescript-eslint/parser",
+    },
+
     // React
     {
       files: ["**/*.{js,jsx,ts,tsx}"],
@@ -84,6 +95,7 @@ module.exports = {
         ".graphqlrc.{js,ts}",
         "shopify.server.{js,ts}",
         "**/*.server.{js,ts}",
+        "app/routes/**/*.{js,jsx,ts,tsx}",
       ],
       env: {
         node: true,
@@ -91,6 +103,6 @@ module.exports = {
     },
   ],
   globals: {
-    shopify: "readonly"
+    shopify: "readonly",
   },
 };
