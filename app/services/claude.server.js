@@ -4,7 +4,7 @@
  */
 import { Anthropic } from "@anthropic-ai/sdk";
 import AppConfig from "./config.server";
-import systemPrompts from "../prompts/prompts.json";
+import systemPrompts from "../prompts/prompts.json" with { type: "json" };
 
 /**
  * Creates a Claude service instance
