@@ -411,7 +411,7 @@
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
           const unorderedMatch = line.match(/^\s*([-*])\s+(.*)/);
-          const orderedMatch = line.match(/^\s*(\d+)[\.)]\s+(.*)/);
+          const orderedMatch = line.match(/^\s*(\d+)[.)]\s+(.*)/);
 
           if (unorderedMatch) {
             if (currentList !== 'ul') {
@@ -507,6 +507,7 @@
           currentMessageElement = messageElement;
 
           // Process the stream
+          // eslint-disable-next-line no-constant-condition
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
@@ -545,57 +546,66 @@
        */
       handleStreamEvent: function(data, currentMessageElement, messagesContainer, userMessage, updateCurrentElement) {
         switch (data.type) {
-          case 'id':
+          case 'id': {
             if (data.conversation_id) {
               sessionStorage.setItem('shopAiConversationId', data.conversation_id);
             }
             break;
+          }
 
-          case 'chunk':
+          case 'chunk': {
             ShopAIChat.UI.removeTypingIndicator();
             currentMessageElement.dataset.rawText += data.chunk;
             currentMessageElement.textContent = currentMessageElement.dataset.rawText;
             ShopAIChat.UI.scrollToBottom();
             break;
+          }
 
-          case 'message_complete':
+          case 'message_complete': {
             ShopAIChat.UI.removeTypingIndicator();
             ShopAIChat.Formatting.formatMessageContent(currentMessageElement);
             ShopAIChat.UI.scrollToBottom();
             break;
+          }
 
-          case 'end_turn':
+          case 'end_turn': {
             ShopAIChat.UI.removeTypingIndicator();
             break;
+          }
 
-          case 'error':
+          case 'error': {
             console.error('Stream error:', data.error);
             ShopAIChat.UI.removeTypingIndicator();
             currentMessageElement.textContent = "Sorry, I couldn't process your request. Please try again later.";
             break;
+          }
 
-          case 'rate_limit_exceeded':
+          case 'rate_limit_exceeded': {
             console.error('Rate limit exceeded:', data.error);
             ShopAIChat.UI.removeTypingIndicator();
             currentMessageElement.textContent = "Sorry, our servers are currently busy. Please try again later.";
             break;
+          }
 
-          case 'auth_required':
+          case 'auth_required': {
             // Save the last user message for resuming after authentication
             sessionStorage.setItem('shopAiLastMessage', userMessage || '');
             break;
+          }
 
-          case 'product_results':
+          case 'product_results': {
             ShopAIChat.UI.displayProductResults(data.products);
             break;
+          }
 
-          case 'tool_use':
+          case 'tool_use': {
             if (data.tool_use_message) {
               ShopAIChat.Message.addToolUse(data.tool_use_message, messagesContainer);
             }
             break;
+          }
 
-          case 'new_message':
+          case 'new_message': {
             ShopAIChat.Formatting.formatMessageContent(currentMessageElement);
             ShopAIChat.UI.showTypingIndicator();
 
@@ -609,10 +619,12 @@
             // Update the current element reference
             updateCurrentElement(newMessageElement);
             break;
+          }
 
-          case 'content_block_complete':
+          case 'content_block_complete': {
             ShopAIChat.UI.showTypingIndicator();
             break;
+          }
         }
       },
 
