@@ -297,7 +297,115 @@ HTTP 配信の場合、Shopify は直接アプリサーバーにリクエスト�
 
 ---
 
+---
+
+## 9. アプリ外部サービスへの Webhook 送信
+
+Shopify の Webhook 通知先はアプリサーバーに限らず、Google Apps Script (GAS) などの外部サービスを直接指定することも可能です。
+
+### 登録方法の比較
+
+| 方法                       | 難易度   | コード            | 適したケース                  |
+| :------------------------- | :------- | :---------------- | :---------------------------- |
+| **Shopify Flow**           | 最も簡単 | 不要              | 試作・Shopify Plus プランのみ |
+| **`shopify.app.toml`**     | 簡単     | 最小限            | カスタムアプリ + 本番運用     |
+| **GraphQL Admin API 直接** | 中程度   | 不要（curl のみ） | 一時的・テスト用              |
+
+### 方法 1: Shopify Flow（コード不要）
+
+```
+orders/create イベント → Flow: "Send HTTP Request" → GAS WebApp URL
+```
+
+- 管理画面の操作だけで完結
+
+### 方法 2: `shopify.app.toml` に外部 URL を直接指定
+
+`uri` にアプリサーバー以外のURLを指定できます。
+
+```toml
+[[webhooks.subscriptions]]
+topics = ["orders/create"]
+uri = "https://script.google.com/macros/s/xxx/exec"
+```
+
+- `shopify app deploy` で登録完了
+- GAS 側は `doPost(e)` を実装して Web アプリとして公開するだけ
+- Shopify の HMAC 署名検証を GAS 側で実装することを推奨
+
+### 方法 3: GraphQL Admin API で直接登録（一度だけ）
+
+Admin API アクセストークンがあれば、アプリコードなしで登録できます。
+
+```bash
+curl -X POST https://your-store.myshopify.com/admin/api/2025-01/graphql.json \
+  -H "X-Shopify-Access-Token: <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation { webhookSubscriptionCreate(topic: ORDERS_CREATE, webhookSubscription: { callbackUrl: \"https://script.google.com/macros/s/xxx/exec\", format: JSON }) { webhookSubscription { id } userErrors { message } } }"
+  }'
+```
+
+- 登録は**一度だけ**で OK。Shopify のDBに保存され、以降はイベント発生ごとに自動 POST される
+- 削除は `webhookSubscriptionDelete(id: "gid://shopify/WebhookSubscription/xxx")` で可能
+
+---
+
+## 10. App-scoped と Shop-scoped の管理上の違い
+
+### `webhookSubscriptions` クエリが返すもの
+
+公式ドキュメントに明記されています：
+
+> **Note: Returns only shop-scoped subscriptions, not app-scoped subscriptions configured in TOML files.**
+>
+> 参照: [WebhookSubscription - GraphQL Admin](https://shopify.dev/docs/api/admin-graphql/latest/objects/WebhookSubscription)
+
+```graphql
+# このクエリは toml で登録した webhook を返さない
+{
+  webhookSubscriptions(first: 10) {
+    edges {
+      node {
+        id
+        topic
+        endpoint {
+          __typename
+          ... on WebhookHttpEndpoint {
+            callbackUrl
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### スコープの概念
+
+|                        | **App-scoped**（toml 管理）              | **Shop-scoped**（API 管理）   |
+| :--------------------- | :--------------------------------------- | :---------------------------- |
+| 登録方法               | `shopify.app.toml` + deploy              | GraphQL Admin API             |
+| 適用範囲               | アプリがインストールされた**全ショップ** | **特定のショップ**のみ        |
+| Subscription ID        | なし（"config-managed"と表示）           | あり                          |
+| `webhookSubscriptions` | 返ってこない                             | 返ってくる                    |
+| 確認方法               | app dashboard > Versions > Configuration | `webhookSubscriptions` クエリ |
+
+「Shop-scoped」という命名は「どのショップに適用されるか」というスコープの話であり、アクセストークン（アプリ）の識別とは別の概念です。API 経由で登録した webhook は、そのアクセストークンが発行されたショップ×アプリに紐付きます。
+
+### toml で登録した Webhook の確認方法
+
+GraphQL API では確認できないため、以下の方法を使います：
+
+1. **`shopify.app.toml` ファイル自体**（ソースオブトゥルース）
+2. **Partner Dashboard** → Apps → [アプリ] → Configuration → Webhooks
+3. **App Dashboard** → Versions → Configuration → Subscriptions
+
+---
+
 _参照ドキュメント:_
 
 - [Shopify Dev: Webhooks overview](https://shopify.dev/docs/apps/build/webhooks)
 - [Shopify Dev: Privacy law compliance](https://shopify.dev/docs/apps/build/compliance/privacy-law-compliance)
+- [Shopify Dev: About managing webhook subscriptions](https://shopify.dev/docs/apps/build/webhooks/subscribe)
+- [Shopify Dev: Subscribe using GraphQL Admin API](https://shopify.dev/docs/apps/build/webhooks/subscribe/subscribe-using-api)
