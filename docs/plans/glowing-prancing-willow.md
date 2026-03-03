@@ -4,6 +4,12 @@
 
 Claude is hardcoded as LLM. Goal: support OpenAI + OpenAI-compatible providers (Cerebras, Groq, Together, etc.) via env var. Single "openai" adapter with configurable `baseURL` covers all OpenAI-compatible APIs.
 
+**Library choice:** `openai` package (not Vercel AI SDK). Reasons:
+- MCP tools already in Claude format → small conversion to OpenAI format
+- Existing SSE streaming is custom — AI SDK targets Next.js patterns
+- 1 new dep vs 3-4
+- `baseURL` option covers all OpenAI-compatible providers natively
+
 ## Design: Factory Functions + Shared Interface
 
 **Not class inheritance** — each provider is a factory function returning an object with the same shape. TS migration-friendly: define `interface LLMProvider` later, each factory returns `: LLMProvider`.
@@ -26,7 +32,40 @@ createXxxProvider(config) → {
 }
 ```
 
-Key: `streamConversation` normalizes output to Claude-style content blocks (`{ type: "text"|"tool_use", ... }`) so chat.jsx and tool.server.js stay unchanged.
+### Callback Contract (normalized across providers)
+
+Both providers MUST call callbacks with identical shapes:
+
+```js
+// onText(delta: string) — text chunk
+onText("Hello")
+
+// onToolUse({ id, name, input }) — normalized tool call
+// Claude: passthrough (already this shape)
+// OpenAI: converted from { id, function: { name, arguments } }
+onToolUse({ id: "call_xyz", name: "search_products", input: { query: "shoes" } })
+
+// onMessage({ role, content }) — Claude-style content blocks
+// content = [{ type: "text", text }, { type: "tool_use", id, name, input }]
+onMessage({ role: "assistant", content: [...] })
+
+// onContentBlock({ type, text? }) — individual block completion
+onContentBlock({ type: "text", text: "full text here" })
+```
+
+Key: providers normalize internally → chat.jsx receives identical data regardless of provider.
+
+### Return Value Contract
+
+```js
+{
+  stopReason: "end_turn" | "tool_use",  // normalized from provider-specific values
+  message: { role: "assistant", content: [/* Claude-style content blocks */] }
+}
+```
+
+- Claude: `stop_reason` → `stopReason` (rename only)
+- OpenAI: `finish_reason === "stop"` → `"end_turn"`, `"tool_calls"` → `"tool_use"`
 
 ## Files to Create
 
@@ -35,6 +74,7 @@ Key: `streamConversation` normalizes output to Claude-style content blocks (`{ t
 - `createClaudeProvider({ apiKey, model, maxTokens })`
 - `formatTools` = identity (MCP already uses Claude format)
 - `createToolResultMessage` = `{ role: 'user', content: [{ type: "tool_result", tool_use_id, content }] }`
+- `streamConversation`: wrap existing Anthropic SDK logic, normalize return to `{ stopReason, message }`
 
 ### 2. `app/services/providers/openai.server.js`
 - `createOpenAIProvider({ apiKey, model, maxTokens, baseURL })`
@@ -43,10 +83,54 @@ Key: `streamConversation` normalizes output to Claude-style content blocks (`{ t
 - `createToolResultMessage` = `{ role: "tool", tool_call_id, content }`
 - `streamConversation`:
   - Prepend system prompt as `{ role: "system" }` message
-  - Use `openai.chat.completions.create({ stream: true })` async iterable
-  - Accumulate text deltas + tool_calls from chunks
+  - Use raw async iterable: `openai.chat.completions.create({ stream: true })`
+  - **Tool call accumulation** (detailed below)
   - Normalize to Claude-style content blocks on finish
-  - Map `finish_reason === "stop"` → `"end_turn"`, `"tool_calls"` → `"tool_use"`
+  - Call `onToolUse` with normalized `{ id, name, input }` shape
+
+#### Tool Call Accumulation (OpenAI streaming)
+
+OpenAI streams tool_calls as delta fragments indexed by position:
+
+```js
+const toolCalls = {};  // index → { id, function: { name, arguments } }
+
+for await (const chunk of stream) {
+  const delta = chunk.choices[0]?.delta;
+  if (!delta) continue;  // guard: some providers send empty deltas
+
+  if (delta.content) {
+    textContent += delta.content;
+    onText?.(delta.content);
+  }
+
+  if (delta.tool_calls) {
+    for (const tc of delta.tool_calls) {
+      const idx = tc.index;
+      if (!toolCalls[idx]) {
+        // First chunk: has id + function.name
+        toolCalls[idx] = { id: tc.id, function: { name: tc.function?.name || "", arguments: "" } };
+      }
+      // Subsequent chunks: append arguments JSON fragments
+      if (tc.function?.arguments) {
+        toolCalls[idx].function.arguments += tc.function.arguments;
+      }
+    }
+  }
+}
+
+// After loop: normalize to Claude-style content blocks
+const content = [];
+if (textContent) content.push({ type: "text", text: textContent });
+for (const tc of Object.values(toolCalls)) {
+  content.push({
+    type: "tool_use",
+    id: tc.id,
+    name: tc.function.name,
+    input: JSON.parse(tc.function.arguments),
+  });
+}
+```
 
 ### 3. `app/services/providers/index.server.js`
 - `createLLMProvider(overrides?)` factory — accepts optional config overrides
@@ -56,13 +140,6 @@ Key: `streamConversation` normalizes output to Claude-style content blocks (`{ t
 ```js
 const PROVIDERS = { claude: createClaudeProvider, openai: createOpenAIProvider };
 
-/**
- * @param {Object} [overrides] - Optional config to override env/defaults
- * @param {string} [overrides.provider] - 'claude' | 'openai'
- * @param {string} [overrides.model] - Model name override
- * @param {number} [overrides.maxTokens] - Token limit override
- * @param {string} [overrides.baseURL] - API base URL override
- */
 export function createLLMProvider(overrides = {}) {
   const providerName = overrides.provider || AppConfig.api.provider;
   const config = {
@@ -75,9 +152,13 @@ export function createLLMProvider(overrides = {}) {
 }
 ```
 
+### 4. `app/services/prompt.server.js`
+- Extract `getSystemPrompt` from `claude.server.js`
+- Simple: reads prompts.json, returns string. Both providers use it.
+
 ## Files to Modify
 
-### 4. `app/services/config.server.js`
+### 5. `app/services/config.server.js`
 - Replace `defaultModel` with provider-aware config:
 ```js
 api: {
@@ -90,49 +171,75 @@ api: {
 ```
 - Genericize error messages: "Claude API" → "AI API"
 
-### 5. `app/routes/chat.jsx`
+### 6. `app/routes/chat.jsx`
 - Replace `createClaudeService` → `createLLMProvider` from providers/index
 - Change loop: `finalMessage.stop_reason` → `result.stopReason` (normalized)
-- Pass `llmProvider.formatTools(mcpClient.tools)` for tools
-- Move `getSystemPrompt` to shared util or inline (it just reads prompts.json)
+- **Cache formatted tools outside loop** (tools don't change mid-conversation):
 
-Changes are small — swap service creation, use normalized return value:
 ```js
 const llmProvider = createLLMProvider();
+const systemPrompt = getSystemPrompt(promptType);
+const formattedTools = llmProvider.formatTools(mcpClient.tools);  // once
+
 let result = { stopReason: null };
 while (result.stopReason !== "end_turn") {
   result = await llmProvider.streamConversation(
-    { messages: conversationHistory, systemPrompt, tools: llmProvider.formatTools(mcpClient.tools) },
+    { messages: conversationHistory, systemPrompt, tools: formattedTools },
     { onText, onToolUse, onMessage, onContentBlock }
   );
 }
 ```
 
-### 6. `app/services/tool.server.js`
+- `onToolUse` callback stays identical — providers deliver normalized `{ id, name, input }`
+- `onMessage` callback stays identical — providers deliver Claude-style content blocks
+
+### 7. `app/services/tool.server.js`
 - `createToolService(llmProvider)` — accept provider
 - `addToolResultToHistory` uses `llmProvider.createToolResultMessage(toolCallId, content)` instead of hardcoded Claude format
+- Everything else unchanged
 
-### 7. `app/services/streaming.server.js`
-- Genericize error strings: "Claude API" → "AI API", "response from Claude" → "AI response"
+### 8. `app/services/streaming.server.js`
+- Genericize error strings only:
+  - "Authentication failed with Claude API" → "Authentication failed with AI API"
+  - "Failed to get response from Claude" → "Failed to get AI response"
+- Error handling logic (status-based branching) works for both SDKs — both expose `.status`
 
-### 8. Delete `app/services/claude.server.js`
+### 9. Delete `app/services/claude.server.js`
 - All logic moved to `providers/claude.server.js`
 
-### 9. `package.json`
+### 10. `package.json`
 - Add `openai` dependency
 
-### 10. `.env`
+### 11. `.env`
 - Add: `LLM_PROVIDER`, `OPENAI_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`
 
 ## DB Conversation History
 
-Store in Claude-style content blocks (current behavior). When loading from DB for OpenAI provider, convert message format. Add `formatHistoryMessage(dbMessage)` to provider interface if needed, or handle in chat.jsx with simple mapping.
+Store in Claude-style content blocks (current behavior). When loading from DB for OpenAI provider, convert message format in `streamConversation` internally.
 
-Note: switching providers between restarts = old conversations may be incompatible. Acceptable for now.
+### Provider field on Conversation
 
-## `getSystemPrompt` utility
+Add `provider` column to track which provider created a conversation:
 
-Move out of claude.server.js into `app/services/prompt.server.js` (simple: reads prompts.json, returns string). Both providers use it.
+```prisma
+model Conversation {
+  id        String  @id @default(uuid())
+  provider  String  @default("claude")
+  // ...existing fields
+}
+```
+
+On conversation load: if `conv.provider !== currentProvider`, log warning. For now, allow continuation (formats are normalized). Later: reject or convert.
+
+## OpenAI-Compatible Provider Notes
+
+| Provider | baseURL | Gotchas |
+|----------|---------|---------|
+| Cerebras | `https://api.cerebras.ai/v1` | `system` role elevated to developer-level — prompts may behave differently |
+| Groq | `https://api.groq.com/openai/v1` | Structured outputs model-dependent; tool calling quality varies by model |
+| Together | `https://api.together.xyz/v1` | Tool calling support is model-specific |
+
+Common: guard `if (!delta) continue;` in streaming loop — some providers send empty delta chunks.
 
 ## Implementation Order
 
@@ -145,8 +252,9 @@ Move out of claude.server.js into `app/services/prompt.server.js` (simple: reads
 7. Update `streaming.server.js` error strings
 8. Delete old `claude.server.js`
 9. Verify Claude still works (no behavior change)
-10. `npm install openai` + create `providers/openai.server.js`
-11. Test with `LLM_PROVIDER=openai`
+10. Add `provider` field to Conversation model + `npm run setup`
+11. `npm install openai` + create `providers/openai.server.js`
+12. Test with `LLM_PROVIDER=openai`
 
 ## Verification
 
