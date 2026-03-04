@@ -35,6 +35,18 @@ export function createClaudeService(apiKey = process.env.CLAUDE_API_KEY) {
     // Get system prompt from configuration or use default
     const systemInstruction = getSystemPrompt(promptType);
 
+    /**
+     * ストリーミングとツール実行の仕組み:
+     * 1. イベントハンドラ (onText, onMessage, onContentBlock) は逐次実行されます。
+     *    - 'text': 生成中の文字を逐次取得（リアルタイム表示用）。
+     *    - 'contentBlock': 一つの回答カタマリ（テキストやツール指示）が完了。
+     *    - 'message': 全生成プロセスが完了。
+     * 2. finalMessage を await することで、ストリームの完了を待ちます。
+     *    - ツール実行指示があった場合、引数のJSONが完全に揃うまで待機が必要です。
+     * 3. ツールが必要な場合、AIは一旦ストリームを終了して指示（tool_use）を出します。
+     *    - ツール実行結果をAIに返すことで、さらに次の回答フェーズが始まります。
+     */
+
     // Create stream
     const stream = await anthropic.messages.stream({
       model: AppConfig.api.defaultModel,
