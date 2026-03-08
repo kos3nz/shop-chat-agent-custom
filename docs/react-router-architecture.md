@@ -16,6 +16,8 @@
 8. [context とは何か](#8-context-とは何か)
 9. [App Bridge の役割](#9-app-bridge-の役割)
 10. [Hydrogen（Cloudflare Workers）での server.ts](#10-hydrogencloudflare-workersでのserverts)
+11. [entry.server.jsx の SSR ストリーミング詳解](#11-entryserverjsx-の-ssr-ストリーミング詳解)
+12. [loader / action の JSON レスポンスとクライアントサイドナビゲーション](#12-loader--action-の-json-レスポンスとクライアントサイドナビゲーション)
 
 ---
 
@@ -95,35 +97,11 @@ export default function App() {
 
 ### `app/entry.server.jsx` — SSR エントリーポイント
 
-React Router フレームワークがサーバー側でレンダリングするときに呼ぶ**SSR のエントリー関数**です。
+React Router フレームワークがサーバー側でレンダリングするときに呼ぶ**SSR のエントリー関数**です。`renderToPipeableStream` で React コンポーネントを HTML ストリームとして出力し、`PassThrough` を経由して Web `Response` に変換します。
 
-```jsx
-export default async function handleRequest(
-  request,
-  responseStatusCode,
-  responseHeaders,
-  reactRouterContext,
-) {
-  addDocumentResponseHeaders(request, responseHeaders); // Shopify 必須ヘッダー注入
-  const callbackName = isbot(userAgent) ? "onAllReady" : "onShellReady";
+このファイルが明示的に書かれている理由は `addDocumentResponseHeaders`（Shopify 必須ヘッダーの注入）のカスタマイズが必要なためです。書かなければ React Router のデフォルト実装が使われます。
 
-  renderToPipeableStream(
-    <ServerRouter context={reactRouterContext} url={request.url} />,
-    {
-      [callbackName]: () => {
-        /* HTML ストリームを Response として返す */
-      },
-    },
-  );
-}
-```
-
-重要な処理が2つあります：
-
-- **`addDocumentResponseHeaders`** — Shopify が要求する CSP（Content Security Policy）などのヘッダーを注入
-- **`isbot` によるボット判定** — クローラーには `onAllReady`（全コンポーネント準備完了後）、通常ユーザーには `onShellReady`（シェル HTML 準備後すぐ）を使い分けてストリーミング
-
-このファイルが明示的に書かれている理由は `addDocumentResponseHeaders` のカスタマイズが必要なためです。書かなければ React Router のデフォルト実装が使われます。
+> ストリーミングの詳細な仕組みは [セクション 11](#11-entryserverjsx-の-ssr-ストリーミング詳解) を参照。
 
 ### `app/shopify.server.js` — Shopify SDK のシングルトン
 
@@ -150,7 +128,7 @@ build/server/index.js
     │   shopify.server.js が認証・セッション管理
     ↓
 entry.server.jsx の handleRequest()
-    ├─ addDocumentResponseHeaders() で Shopify ヘッダー追加
+    ├─ addDocumentResponseHeaders() で Shopify ヘッダー(Content-Security-Policy など)追加
     └─ renderToPipeableStream() で root.jsx → Outlet → 各ルートを SSR
     ↓
 HTML ストリームとして Response を返す
@@ -215,6 +193,43 @@ body: createReadableStreamFromReadable(req);
 await writeReadableStreamToWritable(nodeResponse.body, res);
 ```
 
+#### `handleRequest` が 2 つある理由
+
+`createRequestHandler` 内の `handleRequest` と `entry.server.jsx` の `export default handleRequest` は**別物**です。
+
+| 名前 | 定義元 | 引数 | 役割 |
+| ---- | ------ | ---- | ---- |
+| `handleRequest`（core） | `createRemixRequestHandler(build, mode)` が生成 | `(request, loadContext)` | ルーティング・loader/action 実行 |
+| `handleRequest`（entry） | `entry.server.jsx` の `export default` | `(request, statusCode, headers, context)` | React SSR・ヘッダー付与 |
+
+`entry.server.jsx` が受け取る `responseStatusCode`・`responseHeaders`・`reactRouterContext` は、React Router コアが loader/action 実行後に**内部で組み立てて渡す**ものです。Express アダプターは `entry.server.jsx` を直接呼ばず、コアハンドラーに委譲します：
+
+```
+Express アダプターが呼ぶ:
+  handleRequest_core(request, loadContext)
+    ↓ React Router コアが内部処理
+      ├─ ルートマッチング
+      ├─ loader / action 実行
+      └─ statusCode・headers・reactRouterContext を組み立てる
+    ↓
+  entry.server.jsx の handleRequest(request, statusCode, headers, context)
+```
+
+#### `sendRemixResponse` の詳細
+
+`res.end()` が呼ばれるのは `nodeResponse.body` が `null` のときのみです：
+
+| ケース | body | 例 |
+| ------ | ---- | -- |
+| SSR HTML | ReadableStream | フルページロード |
+| JSON データ | ReadableStream | `Response.json({...})` |
+| SSE | ReadableStream | `/chat` エンドポイント |
+| リダイレクト | `null` | `redirect("/login")` |
+| 204 No Content | `null` | `new Response(null, { status: 204 })` |
+| 304 Not Modified | `null` | HTTP キャッシュ検証 |
+
+Web Fetch API では `new Response("hello")` や `Response.json({...})` のようにボディを渡した場合、`.body` は常に `ReadableStream` になります。`null` になるのは**明示的に body なしと定義されたレスポンス**のみです。
+
 ### `@react-router/serve` — CLI サーバーバイナリ
 
 `#!/usr/bin/env node` から始まる**プロセスとして起動するCLIバイナリ**です。実体は147行のシンプルな Express ラッパーです。
@@ -222,14 +237,19 @@ await writeReadableStreamToWritable(nodeResponse.body, res);
 #### middleware の登録順序（実際のコード通り）
 
 ```javascript
-app.disable("x-powered-by");                  // X-Powered-By ヘッダー除去（セキュリティ）
-app.use(compression());                        // ① レスポンス圧縮
-app.use("/assets", static(assets, {            // ② ハッシュ付き静的ファイル
-  immutable: true, maxAge: "1y"               //    → 1年間キャッシュ固定
-}));
-app.use(publicPath, static(buildDir));         // ③ その他ビルド成果物
-app.use(static("public", { maxAge: "1h" }));  // ④ public/ ディレクトリ
-app.use(morgan("tiny"));                       // ⑤ HTTP ログ
+app.disable("x-powered-by"); // X-Powered-By ヘッダー除去（セキュリティ）
+app.use(compression()); // ① レスポンス圧縮
+app.use(
+  "/assets",
+  static(assets, {
+    // ② ハッシュ付き静的ファイル
+    immutable: true,
+    maxAge: "1y", //    → 1年間キャッシュ固定
+  }),
+);
+app.use(publicPath, static(buildDir)); // ③ その他ビルド成果物
+app.use(static("public", { maxAge: "1h" })); // ④ public/ ディレクトリ
+app.use(morgan("tiny")); // ⑤ HTTP ログ
 app.all("*", createRequestHandler({ build })); // ⑥ React Router 終端ハンドラ
 ```
 
@@ -277,8 +297,7 @@ POST /chat 200 1234 - 89.123 ms
 **ポート解決：**
 
 ```javascript
-let port = parseNumber(process.env.PORT)
-  ?? await getPort({ port: 3000 }); // 3000 が使用中なら 3001, 3002... と探す
+let port = parseNumber(process.env.PORT) ?? (await getPort({ port: 3000 })); // 3000 が使用中なら 3001, 3002... と探す
 ```
 
 **グレースフルシャットダウン：**
@@ -442,11 +461,11 @@ app/entry.server.jsx                     │   "routes/products": │ URL → �
                                          「リクエストをどう処理するか」を知っている
 ```
 
-| 担当 | 役割 |
-|------|------|
-| **Vite** | ファイルをスキャン・変換・バンドルして「地図」を作る |
-| **virtual module** | その「地図」の実体（routes + entry + assets の集合） |
-| **createRequestHandler** | 地図を受け取り、URL に応じて該当ルートを呼ぶ |
+| 担当                     | 役割                                                 |
+| ------------------------ | ---------------------------------------------------- |
+| **Vite**                 | ファイルをスキャン・変換・バンドルして「地図」を作る |
+| **virtual module**       | その「地図」の実体（routes + entry + assets の集合） |
+| **createRequestHandler** | 地図を受け取り、URL に応じて該当ルートを呼ぶ         |
 
 React Router 本体は「Web Fetch API しか知らない」純粋なルーターです。Node.js か Cloudflare Workers かを気にしません。`createRequestHandler` に渡す `build`（= virtual module の実体）が変わるだけで、同じ React Router がどのランタイムでも動きます。
 
@@ -800,6 +819,277 @@ Cloudflare Workers にはファイルシステムがないため、全ルート�
 ### カスタムサーバー（Express）への移行
 
 `@react-router/serve` の代わりに自前の Express サーバーを書く場合は [`docs/custom-express-server.md`](./custom-express-server.md) を参照してください。`getLoadContext` を使って DB クライアントや認証情報を全 loader/action に注入できます。
+
+---
+
+## 11. entry.server.jsx の SSR ストリーミング詳解
+
+### React 18 の 2 つの SSR Streaming API
+
+React 18 では、実行環境に応じた 2 つのストリーミング SSR API が提供されています（[React 公式ドキュメント](https://react.dev/reference/react-dom/server/renderToPipeableStream)）。
+
+| API                      | 対象環境                    | 返り値            | ストリーム規格  |
+| ------------------------ | --------------------------- | ----------------- | --------------- |
+| `renderToPipeableStream` | Node.js                     | `{ pipe, abort }` | Node.js Stream  |
+| `renderToReadableStream` | Deno, Cloudflare Workers 等 | `ReadableStream`  | Web Streams API |
+
+React のレンダリングエンジン自体は環境非依存で、**出口（ストリームの種類）だけが環境ごとに異なる**設計です。
+
+### Node.js 環境でのストリーミングフロー
+
+このプロジェクトの `entry.server.jsx` を例に、データの流れを詳しく見ます。
+
+```jsx
+const { pipe, abort } = renderToPipeableStream(
+  <ServerRouter context={reactRouterContext} url={request.url} />,
+  {
+    [callbackName]: () => {
+      const body = new PassThrough();                         // ①
+      const stream = createReadableStreamFromReadable(body);  // ②
+      resolve(new Response(stream, { ... }));                 // ③
+      pipe(body);                                             // ④
+    },
+  },
+);
+```
+
+#### 各行の役割
+
+| 行  | 処理                                     | 説明                                                                                                        |
+| --- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| ①   | `new PassThrough()`                      | Node.js の Duplex ストリーム（Writable + Readable）を作成。**書き込み口と読み出し口の両方を持つ**空のパイプ |
+| ②   | `createReadableStreamFromReadable(body)` | `body` の **Readable 側**（読み出し口）にアタッチし、Web `ReadableStream` として公開                        |
+| ③   | `resolve(new Response(stream, ...))`     | Web `Response` に `stream` への**参照を渡す**だけ。この時点でデータは読み出されない                         |
+| ④   | `pipe(body)`                             | React が `body` の **Writable 側**（書き込み口）に HTML チャンクを書き始める                                |
+
+#### PassThrough が橋渡しをする仕組み
+
+`PassThrough` は Node.js `stream` モジュールの **Duplex ストリーム**（`Transform` の一種）で、入力をそのまま出力に流す「素通しパイプ」です。Writable/Readable を一体化しているため、異なる 2 つのシステムを繋ぐ中継点として機能します。
+
+```
+【React の Node.js 世界】              【Response の Web 標準世界】
+
+renderToPipeableStream                 createReadableStreamFromReadable(body)
+        │                                          │
+        │ pipe(body)                               │ body の Readable 側を読む
+        ▼                                          ▼
+┌────────────────────────────────────────────────────────┐
+│                    PassThrough (body)                   │
+│                                                        │
+│   Writable 側 ─── write() ──→ 内部バッファ ──→ read() ─── Readable 側  │
+│       ▲                                                     │          │
+│    React が                                          Web ReadableStream │
+│    HTML を書く                                       (stream) として公開 │
+└────────────────────────────────────────────────────────┘
+                                                        │
+                                                        ▼
+                                              new Response(stream)
+                                                        │
+                                                        ▼
+                                              HTTP サーバーがクライアントに送信
+```
+
+#### なぜ Promise で包んでいるのか
+
+`handleRequest` は React Router の契約で `Promise<Response>` を返す必要があります。しかし `renderToPipeableStream` はコールバック型 API（Promise を返さない）です。そのため `new Promise()` で包み、コールバック内で `resolve` / `reject` を呼んで Promise に変換しています。
+
+```jsx
+// handleRequest は Promise<Response> を返す必要がある（React Router の契約）
+return new Promise((resolve, reject) => {
+  const { pipe, abort } = renderToPipeableStream(<ServerRouter />, {
+    onShellReady() {
+      resolve(new Response(stream)); // コールバック → Promise に変換
+    },
+    onShellError(error) {
+      reject(error); // エラーも Promise に変換
+    },
+  });
+});
+```
+
+`renderToPipeableStream` がコールバック型なのは、Node.js Stream API 自体がイベント/コールバック型の設計に基づいているためです。対して Cloudflare Workers 版の `renderToReadableStream` は最初から Promise を返すため、`await` で直接受け取れます（[後述の比較表](#cloudflare-workershydrogenとの比較)を参照）。
+
+#### `resolve()` → `pipe()` の順序の理由
+
+ストリームは**遅延評価**です。`new Response(stream)` は `stream` への参照を保持するだけで、データをまだ読み出しません。
+
+```
+resolve() 呼出し          → Promise 解決。Response オブジェクト（参照）が渡る
+pipe(body) 呼出し         → React が body への書き込みを開始
+HTTP サーバーが stream を読む → body からデータが流れ始める ← ここで初めて実際のデータ転送
+```
+
+`pipe(body)` を先に呼ぶと、`resolve()` 前にデータが流れ始め、`PassThrough` のバッファが溢れるリスクがあるため、現在の順序（Response 参照を先に確保 → pipe 開始）は意図的です。
+
+### Cloudflare Workers（Hydrogen）との比較
+
+Cloudflare Workers は Web Streams API をネイティブサポートするため、変換レイヤーが一切不要です。
+
+```jsx
+// Cloudflare Workers（Hydrogen）: renderToReadableStream を使用
+const body = await renderToReadableStream(<ServerRouter ... />);
+//    ^^^^ 既に Web ReadableStream
+
+if (isbot(request.headers.get('user-agent'))) {
+  await body.allReady;  // Promise ベースで全データ待ち
+}
+
+return new Response(body, { ... });  // そのまま渡せる
+```
+
+|                 | Node.js（このプロジェクト）                      | Cloudflare Workers（Hydrogen） |
+| --------------- | ------------------------------------------------ | ------------------------------ |
+| SSR API         | `renderToPipeableStream`                         | `renderToReadableStream`       |
+| 返り値          | `{ pipe, abort }`（コールバック型）              | `ReadableStream`（Promise 型） |
+| 変換            | PassThrough + `createReadableStreamFromReadable` | 不要                           |
+| bot 判定        | `onShellReady` / `onAllReady` コールバック       | `await body.allReady`          |
+| Response に渡す | 変換済み Web `ReadableStream`                    | そのまま                       |
+
+### Node.js で `renderToReadableStream` を使わない理由
+
+`renderToReadableStream` は Node.js 18+ でも技術的には動作しますが、`renderToPipeableStream` が採用されています。
+
+| | `renderToPipeableStream`（採用） | `renderToReadableStream` |
+| -- | -------------------------------- | ------------------------ |
+| 設計対象 | **Node.js** | Deno, Cloudflare Workers, Bun |
+| バックプレッシャー | Node.js `Writable` が TCP バッファと連携して自動調整 | Web Streams API で制御 |
+| API スタイル | コールバック型（`onShellReady`） | Promise 型（`await`） |
+| React の推奨 | Node.js 環境ではこちら | エッジ環境ではこちら |
+
+`renderToReadableStream` を使えば PassThrough・`createReadableStreamFromReadable` が不要になりシンプルになりますが：
+
+```js
+// renderToReadableStream を使う場合（Node.js 18+ で動作可能）
+const body = await renderToReadableStream(<ServerRouter />, { ... });
+return new Response(body, { headers: responseHeaders, status: responseStatusCode });
+```
+
+`renderToPipeableStream` を採用する理由は **Node.js のバックプレッシャー機構**にあります。Node.js の `Writable` はダウンストリーム（TCP 送信バッファ）が詰まると `write()` が `false` を返し、React のレンダリング速度を自動調整します。Node.js 環境では Node.js ストリームの方が内部最適化が効いているため、PassThrough を介した変換が「意図的なトレードオフ」として残っています。
+
+### 素の Express（React Router なし）との比較
+
+React Router を使わず Express で直接書く場合、変換は一切不要です。
+
+```js
+app.get("*", (req, res) => {
+  res.setHeader("Content-Type", "text/html");
+
+  const { pipe } = renderToPipeableStream(<App />, {
+    onShellReady() {
+      res.statusCode = 200;
+      pipe(res); // Express の res は Node.js Writable なので直接 pipe できる
+    },
+  });
+});
+```
+
+Express の `res` は Node.js の `Writable` を継承しているため、`pipe(res)` で直接 HTML を流せます。PassThrough も `createReadableStreamFromReadable` も不要です。
+
+### なぜ Node.js 環境なのに Web Fetch API の Response に変換するのか
+
+React Router v7 は **Web Fetch API を内部の共通インターフェースとして採用**しています。`entry.server.jsx` の `handleRequest` は React Router から呼ばれ、**Web `Response` を返すことが契約**です。
+
+```
+Express の req/res                              クライアント
+(Node.js 型)                                       ↑
+     ↓                                             │
+@react-router/node アダプター              @react-router/node アダプター
+  req → Request (Web)                       Response (Web) → res
+     ↓                                             ↑
+  handleRequest(request, ...)  →→→  return new Response(stream)
+        Web Fetch API の世界で完結
+```
+
+アプリコード（`entry.server.jsx`）は Node.js の `req`/`res` に一切触れず、Web 標準の世界だけで完結します。これにより、アダプター（`@react-router/node`、`@react-router/cloudflare`）を差し替えるだけで同じコードが複数環境で動く設計になっています。
+
+これは React Router だけでなく、Remix、Hono、SvelteKit など現代のフレームワークに共通する **"Web Standard First"** 設計思想です。
+
+---
+
+## 12. loader / action の JSON レスポンスとクライアントサイドナビゲーション
+
+### JSON レスポンスも ReadableStream を通る
+
+`loader` や `action` が JSON を返す場合も、`sendRemixResponse` の stream パスを通ります：
+
+```js
+export const loader = async () => {
+  return Response.json({ products: [...] });
+  // → Response.body = ReadableStream（JSON 文字列を流す）
+};
+```
+
+Web Fetch API では文字列・JSON をボディに渡しても、内部で自動的に `ReadableStream` にラップされます。`writeReadableStreamToWritable` で JSON が Express `res` に流れ、`res.end()` は呼ばれません：
+
+```
+loader が return Response.json({ key: "value" })
+  ↓
+nodeResponse.body = ReadableStream（JSON 文字列を内包）
+  ↓
+writeReadableStreamToWritable(nodeResponse.body, res)
+  ↓
+Express res に JSON が書き込まれてクライアントへ送信
+```
+
+### クライアントサイドナビゲーション時のデータ取得
+
+React Router は初回ロード後のクライアントサイドナビゲーションで、HTML を取得せず **loader データだけを fetch** します：
+
+```
+初回ロード:    GET /products                        → SSR HTML（React レンダリング込み）
+ナビゲーション: GET /products?_data=routes/products → JSON のみ（loader 結果）
+```
+
+`?_data=routes/products` クエリパラメーターが付いたリクエストは React Router コアが識別し、`entry.server.jsx` の `handleRequest`（React SSR）を呼ばずに loader の戻り値だけを JSON として返します。同じ `/products` エンドポイントが SSR とデータ取得の両方を担います。
+
+### API エンドポイントとしての loader
+
+```
+フルページリクエスト     GET /products
+  → entry.server.jsx の handleRequest → React SSR → HTML ストリーム
+
+クライアントナビゲーション GET /products?_data=routes/products
+  → loader のみ実行 → JSON レスポンス（SSR スキップ）
+
+API エンドポイント       GET /api/products
+  → loader のみ実行 → JSON レスポンス（SSR スキップ）
+```
+
+どのケースも `sendRemixResponse` → `writeReadableStreamToWritable` を通ります。`res.end()` が呼ばれるのはリダイレクト・204・304 のみです。
+
+### `entry.server.jsx` が呼ばれるタイミング
+
+`entry.server.jsx` は **React SSR が必要なレスポンスのときだけ**呼ばれます。loader / action は React Router コアがその前に処理し、コンポーネントが不要なら `entry.server.jsx` はスキップされます。
+
+| ルートの種類 | entry.server.jsx | 理由 |
+| ------------ | ---------------- | ---- |
+| React コンポーネントあり（通常ページ） | 呼ばれる | SSR が必要 |
+| `loader` のみ（API エンドポイント） | 呼ばれない | JSON を直接返すだけ |
+| `redirect()` を返す loader | 呼ばれない | body なしで終端 |
+| クライアントナビゲーション（`?_data=`） | 呼ばれない | loader データだけ必要 |
+
+### `reactRouterContext` の中身
+
+`reactRouterContext` には loader / action の実行結果が含まれています：
+
+```js
+reactRouterContext = {
+  staticHandlerContext: {
+    loaderData: {
+      "routes/products": { products: [...] },  // ← loader の return 値
+    },
+    matches: [...],   // マッチしたルート
+    errors: null,
+  },
+  routeModules: {
+    "routes/products": { default: ProductsPage, loader, ... },
+  },
+  manifest: { ... },
+  serverHandoffString: "...",  // クライアントへの引き継ぎ JSON（useLoaderData の源泉）
+}
+```
+
+`entry.server.jsx` の `handleRequest` はこの `reactRouterContext` を `<ServerRouter context={reactRouterContext}>` に渡すことで、loader データがすでに注入された状態でコンポーネントツリーを SSR します。コンポーネント内の `useLoaderData()` は SSR 時も hydration 後も、この `loaderData` から値を取得します。
 
 ---
 
