@@ -77,7 +77,8 @@ async function handleChatRequest(request) {
     }
 
     // Generate or use existing conversation ID
-    const conversationId = body.conversation_id || Date.now().toString();
+    /** @type {string} */
+    const conversationId = body.conversation_id || crypto.randomUUID();
     const promptType = body.prompt_type || AppConfig.api.defaultPromptType;
 
     // Create a stream for the response
